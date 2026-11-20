@@ -28,6 +28,7 @@ pub enum ErrorCode {
     PayloadTooLarge = 413,
     InternalServerError = 500,
     NotImplemented = 501,
+    ServiceUnavailable = 503,
     VersionNotSupported = 505,
 }
 
@@ -38,6 +39,7 @@ impl ErrorCode {
             413 => Some(Self::PayloadTooLarge),
             500 => Some(Self::InternalServerError),
             501 => Some(Self::NotImplemented),
+            503 => Some(Self::ServiceUnavailable),
             505 => Some(Self::VersionNotSupported),
             _ => None,
         }
@@ -49,6 +51,7 @@ impl ErrorCode {
             Self::PayloadTooLarge => "Content Too Large",
             Self::InternalServerError => "Internal Server Error",
             Self::NotImplemented => "Not Implemented",
+            Self::ServiceUnavailable => "Service Unavailable",
             Self::VersionNotSupported => "Version Not Supported",
         }
     }

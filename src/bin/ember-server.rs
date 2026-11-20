@@ -1,6 +1,7 @@
 use emberdb::codec::{CodecError, ErrorCode, Response, decode_request, encode_response};
 use emberdb::command::execute;
 use emberdb::config::ServerConfig;
+use emberdb::connection::ConnectionLimiter;
 use emberdb::protocol::{read_frame, write_frame};
 use emberdb::store::Store;
 
@@ -55,6 +56,7 @@ fn handle_client(mut stream: TcpStream, store: &Store, config: &ServerConfig) ->
 fn main() -> io::Result<()> {
     let config = Arc::new(ServerConfig::from_env()?);
     let store = Arc::new(Store::new());
+    let limiter = Arc::new(ConnectionLimiter::new(config.max_clients));
 
     let listener = TcpListener::bind(&config.bind_addr)?;
     println!("EmberDB listening on {}", &config.bind_addr);
@@ -62,13 +64,37 @@ fn main() -> io::Result<()> {
     for connection in listener.incoming() {
         match connection {
             Ok(stream) => {
+                let Some(permit) = limiter.try_acquire() else {
+                    eprintln!(
+                        "Connection rejected: limit of {} reached",
+                        config.max_clients
+                    );
+
+                    let response = encode_response(&Response::Error(ErrorCode::ServiceUnavailable))
+                        .expect("503 response must be encoded");
+
+                    let mut stream = stream;
+                    stream.set_write_timeout(Some(config.write_timeout)).ok();
+
+                    if let Err(error) = write_frame(&mut stream, &response) {
+                        eprintln!("Failed to send rejection: {error}")
+                    }
+
+                    drop(stream);
+                    continue;
+                };
+
                 let store = Arc::clone(&store);
                 let config = Arc::clone(&config);
-                thread::spawn(move || {
+
+                if let Err(error) = thread::Builder::new().spawn(move || {
+                    let _permit = permit;
                     if let Err(error) = handle_client(stream, &store, &config) {
                         eprintln!("Client error: {error}");
                     }
-                });
+                }) {
+                    eprintln!("Failed to spawn client thread: {error}")
+                }
             }
             Err(error) => eprintln!("Accept error: {error}"),
         }
