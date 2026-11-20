@@ -18,6 +18,8 @@ pub enum Request {
     Get { key: Vec<u8> },
     Delete { key: Vec<u8> },
     Exists { key: Vec<u8> },
+    Expire { key: Vec<u8>, seconds: i64 },
+    Ttl { key: Vec<u8> },
 }
 
 /// HTTP-equivalent error numbers. Success results have their own response tags.
@@ -63,7 +65,7 @@ pub enum Response {
     Ok,
     Value(Vec<u8>),
     Nil,
-    Integer(u64),
+    Integer(i64),
     Error(ErrorCode),
 }
 
@@ -121,11 +123,11 @@ fn read_u32(input: &mut &[u8]) -> Result<u32, CodecError> {
     Ok(u32::from_be_bytes(bytes))
 }
 
-fn read_u64(input: &mut &[u8]) -> Result<u64, CodecError> {
+fn read_i64(input: &mut &[u8]) -> Result<i64, CodecError> {
     let bytes: [u8; 8] = take(input, 8)?
         .try_into()
         .map_err(|_| CodecError::Malformed)?;
-    Ok(u64::from_be_bytes(bytes))
+    Ok(i64::from_be_bytes(bytes))
 }
 
 fn read_blob(input: &mut &[u8]) -> Result<Vec<u8>, CodecError> {
@@ -162,6 +164,19 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>, CodecError> {
             out.push(0x05);
             append_blob(&mut out, key)?;
         }
+        Request::Expire { key, seconds } => {
+            out.push(0x06);
+            append_blob(&mut out, key)?;
+            out.extend_from_slice(&seconds.to_be_bytes());
+        }
+
+        Request::Ttl { key } => {
+            out.push(0x07);
+            append_blob(&mut out, key)?;
+        }
+    }
+    if out.len() > MAX_FRAME_SIZE {
+        return Err(CodecError::TooLarge);
     }
     Ok(out)
 }
@@ -187,6 +202,14 @@ pub fn decode_request(data: &[u8]) -> Result<Request, CodecError> {
             key: read_blob(&mut input)?,
         },
         0x05 => Request::Exists {
+            key: read_blob(&mut input)?,
+        },
+        0x06 => Request::Expire {
+            key: read_blob(&mut input)?,
+            seconds: read_i64(&mut input)?,
+        },
+
+        0x07 => Request::Ttl {
             key: read_blob(&mut input)?,
         },
         _ => return Err(CodecError::UnknownOpcode),
@@ -230,7 +253,7 @@ pub fn decode_response(data: &[u8]) -> Result<Response, CodecError> {
         0x02 => Response::Ok,
         0x03 => Response::Value(read_blob(&mut input)?),
         0x04 => Response::Nil,
-        0x05 => Response::Integer(read_u64(&mut input)?),
+        0x05 => Response::Integer(read_i64(&mut input)?),
         0xFF => {
             let status = read_u16(&mut input)?;
             let error = ErrorCode::from_u16(status).ok_or(CodecError::Malformed)?;
@@ -263,6 +286,17 @@ mod tests {
             Request::Exists {
                 key: b"key".to_vec(),
             },
+            Request::Expire {
+                key: b"session".to_vec(),
+                seconds: 60,
+            },
+            Request::Ttl {
+                key: b"session".to_vec(),
+            },
+            Request::Expire {
+                key: b"negative".to_vec(),
+                seconds: -10,
+            },
         ];
         for command in commands {
             assert_eq!(
@@ -279,7 +313,8 @@ mod tests {
             Response::Ok,
             Response::Nil,
             Response::Value(vec![0, 255, 10]),
-            Response::Integer(u64::MAX),
+            Response::Integer(i64::MAX),
+            Response::Integer(i64::MIN),
             Response::Error(ErrorCode::BadRequest),
             Response::Error(ErrorCode::PayloadTooLarge),
             Response::Error(ErrorCode::InternalServerError),

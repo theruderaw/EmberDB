@@ -24,6 +24,7 @@ pub fn execute(store: &Store, request: Request) -> Response {
             Ok(false) => Response::Integer(0),
             Err(_) => Response::Error(ErrorCode::InternalServerError),
         },
+        Request::Expire { .. } | Request::Ttl { .. } => Response::Error(ErrorCode::NotImplemented),
     }
 }
 
