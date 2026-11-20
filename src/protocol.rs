@@ -106,7 +106,10 @@ mod tests {
 
     #[test]
     fn clean_eof() {
-        assert_eq!(read_frame(&mut Cursor::new(Vec::<u8>::new())).unwrap(), None);
+        assert_eq!(
+            read_frame(&mut Cursor::new(Vec::<u8>::new())).unwrap(),
+            None
+        );
     }
 
     #[test]

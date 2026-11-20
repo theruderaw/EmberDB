@@ -1,4 +1,4 @@
-use emberdb::codec::{decode_response, encode_request, CodecError, ErrorCode, Request, Response};
+use emberdb::codec::{CodecError, ErrorCode, Request, Response, decode_response, encode_request};
 use emberdb::config::load_address;
 use emberdb::protocol::{read_frame, write_frame};
 
@@ -9,9 +9,7 @@ fn parse_command(input: &str) -> Result<Request, (ErrorCode, &'static str)> {
     let words: Vec<&str> = input.split_whitespace().collect();
     match words.as_slice() {
         [cmd] if cmd.eq_ignore_ascii_case("PING") => Ok(Request::Ping),
-        [cmd, key, values @ ..]
-            if cmd.eq_ignore_ascii_case("SET") && !values.is_empty() =>
-        {
+        [cmd, key, values @ ..] if cmd.eq_ignore_ascii_case("SET") && !values.is_empty() => {
             Ok(Request::Set {
                 key: key.as_bytes().to_vec(),
                 value: values.join(" ").into_bytes(),
@@ -105,7 +103,10 @@ fn main() -> io::Result<()> {
             }
         };
         let response = decode_response(&response_payload).map_err(|error| {
-            io::Error::new(ErrorKind::InvalidData, format!("invalid server response: {error:?}"))
+            io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid server response: {error:?}"),
+            )
         })?;
         display_response(response);
     }

@@ -35,15 +35,36 @@ mod tests {
     fn commands_work() {
         let store = Store::new();
         assert_eq!(execute(&store, Request::Ping), Response::Pong);
-        assert_eq!(execute(&store, Request::Get { key: b"x".to_vec() }), Response::Nil);
         assert_eq!(
-            execute(&store, Request::Set { key: b"x".to_vec(), value: b"hello".to_vec() }),
+            execute(&store, Request::Get { key: b"x".to_vec() }),
+            Response::Nil
+        );
+        assert_eq!(
+            execute(
+                &store,
+                Request::Set {
+                    key: b"x".to_vec(),
+                    value: b"hello".to_vec()
+                }
+            ),
             Response::Ok
         );
-        assert_eq!(execute(&store, Request::Get { key: b"x".to_vec() }), Response::Value(b"hello".to_vec()));
-        assert_eq!(execute(&store, Request::Exists { key: b"x".to_vec() }), Response::Integer(1));
-        assert_eq!(execute(&store, Request::Delete { key: b"x".to_vec() }), Response::Integer(1));
-        assert_eq!(execute(&store, Request::Delete { key: b"x".to_vec() }), Response::Integer(0));
+        assert_eq!(
+            execute(&store, Request::Get { key: b"x".to_vec() }),
+            Response::Value(b"hello".to_vec())
+        );
+        assert_eq!(
+            execute(&store, Request::Exists { key: b"x".to_vec() }),
+            Response::Integer(1)
+        );
+        assert_eq!(
+            execute(&store, Request::Delete { key: b"x".to_vec() }),
+            Response::Integer(1)
+        );
+        assert_eq!(
+            execute(&store, Request::Delete { key: b"x".to_vec() }),
+            Response::Integer(0)
+        );
     }
 
     #[test]
@@ -51,7 +72,19 @@ mod tests {
         let store = Store::new();
         let key = vec![0, 255, 10];
         let value = vec![128, 0, 32, 255];
-        assert_eq!(execute(&store, Request::Set { key: key.clone(), value: value.clone() }), Response::Ok);
-        assert_eq!(execute(&store, Request::Get { key }), Response::Value(value));
+        assert_eq!(
+            execute(
+                &store,
+                Request::Set {
+                    key: key.clone(),
+                    value: value.clone()
+                }
+            ),
+            Response::Ok
+        );
+        assert_eq!(
+            execute(&store, Request::Get { key }),
+            Response::Value(value)
+        );
     }
 }

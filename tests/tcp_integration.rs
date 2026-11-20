@@ -1,5 +1,5 @@
-use emberdb::codec::{decode_response, encode_request, ErrorCode, Request, Response, VERSION};
-use emberdb::protocol::{read_frame, write_frame, MAX_FRAME_SIZE};
+use emberdb::codec::{ErrorCode, Request, Response, VERSION, decode_response, encode_request};
+use emberdb::protocol::{MAX_FRAME_SIZE, read_frame, write_frame};
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
@@ -43,8 +43,12 @@ fn start_server() -> (TestServer, SocketAddr) {
 
 fn connect(address: SocketAddr) -> TcpStream {
     let stream = TcpStream::connect(address).unwrap();
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
     stream
 }
 
@@ -70,9 +74,24 @@ fn clients_share_binary_values() {
     let value = vec![128, 0, 32, 255];
 
     assert_eq!(request(&mut a, Request::Ping), Response::Pong);
-    assert_eq!(request(&mut a, Request::Set { key: key.clone(), value: value.clone() }), Response::Ok);
-    assert_eq!(request(&mut b, Request::Get { key: key.clone() }), Response::Value(value));
-    assert_eq!(request(&mut b, Request::Delete { key: key.clone() }), Response::Integer(1));
+    assert_eq!(
+        request(
+            &mut a,
+            Request::Set {
+                key: key.clone(),
+                value: value.clone()
+            }
+        ),
+        Response::Ok
+    );
+    assert_eq!(
+        request(&mut b, Request::Get { key: key.clone() }),
+        Response::Value(value)
+    );
+    assert_eq!(
+        request(&mut b, Request::Delete { key: key.clone() }),
+        Response::Integer(1)
+    );
     assert_eq!(request(&mut a, Request::Get { key }), Response::Nil);
     assert_eq!(request(&mut a, Request::Ping), Response::Pong);
     assert_eq!(request(&mut b, Request::Ping), Response::Pong);
@@ -83,9 +102,18 @@ fn errors_have_http_equivalent_codes_and_connection_survives() {
     let (_server, address) = start_server();
     let mut client = connect(address);
 
-    assert_eq!(raw_request(&mut client, &[VERSION, 0x77]), Response::Error(ErrorCode::NotImplemented));
-    assert_eq!(raw_request(&mut client, &[VERSION, 0x03, 0]), Response::Error(ErrorCode::BadRequest));
-    assert_eq!(raw_request(&mut client, &[1, 0x01]), Response::Error(ErrorCode::VersionNotSupported));
+    assert_eq!(
+        raw_request(&mut client, &[VERSION, 0x77]),
+        Response::Error(ErrorCode::NotImplemented)
+    );
+    assert_eq!(
+        raw_request(&mut client, &[VERSION, 0x03, 0]),
+        Response::Error(ErrorCode::BadRequest)
+    );
+    assert_eq!(
+        raw_request(&mut client, &[1, 0x01]),
+        Response::Error(ErrorCode::VersionNotSupported)
+    );
     assert_eq!(request(&mut client, Request::Ping), Response::Pong);
 }
 
@@ -98,7 +126,12 @@ fn oversized_frame_returns_413_then_disconnects() {
     use std::io::Write;
     client.write_all(&too_large).unwrap();
 
-    let payload = read_frame(&mut client).unwrap().expect("expected 413 response");
-    assert_eq!(decode_response(&payload), Ok(Response::Error(ErrorCode::PayloadTooLarge)));
+    let payload = read_frame(&mut client)
+        .unwrap()
+        .expect("expected 413 response");
+    assert_eq!(
+        decode_response(&payload),
+        Ok(Response::Error(ErrorCode::PayloadTooLarge))
+    );
     assert_eq!(read_frame(&mut client).unwrap(), None);
 }

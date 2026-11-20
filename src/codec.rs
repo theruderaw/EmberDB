@@ -105,17 +105,23 @@ fn read_u8(input: &mut &[u8]) -> Result<u8, CodecError> {
 }
 
 fn read_u16(input: &mut &[u8]) -> Result<u16, CodecError> {
-    let bytes: [u8; 2] = take(input, 2)?.try_into().map_err(|_| CodecError::Malformed)?;
+    let bytes: [u8; 2] = take(input, 2)?
+        .try_into()
+        .map_err(|_| CodecError::Malformed)?;
     Ok(u16::from_be_bytes(bytes))
 }
 
 fn read_u32(input: &mut &[u8]) -> Result<u32, CodecError> {
-    let bytes: [u8; 4] = take(input, 4)?.try_into().map_err(|_| CodecError::Malformed)?;
+    let bytes: [u8; 4] = take(input, 4)?
+        .try_into()
+        .map_err(|_| CodecError::Malformed)?;
     Ok(u32::from_be_bytes(bytes))
 }
 
 fn read_u64(input: &mut &[u8]) -> Result<u64, CodecError> {
-    let bytes: [u8; 8] = take(input, 8)?.try_into().map_err(|_| CodecError::Malformed)?;
+    let bytes: [u8; 8] = take(input, 8)?
+        .try_into()
+        .map_err(|_| CodecError::Malformed)?;
     Ok(u64::from_be_bytes(bytes))
 }
 
@@ -241,13 +247,25 @@ mod tests {
     fn request_round_trip_including_binary() {
         let commands = [
             Request::Ping,
-            Request::Set { key: vec![0, 255], value: vec![10, 0, 128] },
-            Request::Get { key: b"hello world".to_vec() },
-            Request::Delete { key: b"key".to_vec() },
-            Request::Exists { key: b"key".to_vec() },
+            Request::Set {
+                key: vec![0, 255],
+                value: vec![10, 0, 128],
+            },
+            Request::Get {
+                key: b"hello world".to_vec(),
+            },
+            Request::Delete {
+                key: b"key".to_vec(),
+            },
+            Request::Exists {
+                key: b"key".to_vec(),
+            },
         ];
         for command in commands {
-            assert_eq!(decode_request(&encode_request(&command).unwrap()), Ok(command));
+            assert_eq!(
+                decode_request(&encode_request(&command).unwrap()),
+                Ok(command)
+            );
         }
     }
 
@@ -266,7 +284,10 @@ mod tests {
             Response::Error(ErrorCode::VersionNotSupported),
         ];
         for response in responses {
-            assert_eq!(decode_response(&encode_response(&response).unwrap()), Ok(response));
+            assert_eq!(
+                decode_response(&encode_response(&response).unwrap()),
+                Ok(response)
+            );
         }
     }
 
@@ -284,12 +305,30 @@ mod tests {
 
     #[test]
     fn invalid_frames_are_rejected() {
-        assert_eq!(decode_request(&[VERSION, 0x03, 0, 0, 0, 5, b'a']), Err(CodecError::Malformed));
-        assert_eq!(decode_request(&[VERSION, 0x01, 99]), Err(CodecError::Malformed));
-        assert_eq!(decode_request(&[VERSION, 0x77]), Err(CodecError::UnknownOpcode));
-        assert_eq!(decode_request(&[1, 0x01]), Err(CodecError::UnsupportedVersion));
-        assert_eq!(decode_response(&[VERSION, 0xFF, 0x03, 0xE7]), Err(CodecError::Malformed));
-        assert_eq!(decode_response(&[VERSION, 0xFF, 0x01]), Err(CodecError::Malformed));
+        assert_eq!(
+            decode_request(&[VERSION, 0x03, 0, 0, 0, 5, b'a']),
+            Err(CodecError::Malformed)
+        );
+        assert_eq!(
+            decode_request(&[VERSION, 0x01, 99]),
+            Err(CodecError::Malformed)
+        );
+        assert_eq!(
+            decode_request(&[VERSION, 0x77]),
+            Err(CodecError::UnknownOpcode)
+        );
+        assert_eq!(
+            decode_request(&[1, 0x01]),
+            Err(CodecError::UnsupportedVersion)
+        );
+        assert_eq!(
+            decode_response(&[VERSION, 0xFF, 0x03, 0xE7]),
+            Err(CodecError::Malformed)
+        );
+        assert_eq!(
+            decode_response(&[VERSION, 0xFF, 0x01]),
+            Err(CodecError::Malformed)
+        );
     }
 
     #[test]
