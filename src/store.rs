@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug)]
 pub enum StoreError {
     LockPoisoned,
+    InvalidExpiration,
 }
 
 #[derive(Debug, Clone)]
@@ -117,7 +118,10 @@ impl Store {
             return Ok(true);
         }
 
-        entry.expires_at = Some(Instant::now() + ttl);
+        let deadline = Instant::now()
+            .checked_add(ttl)
+            .ok_or(StoreError::InvalidExpiration)?;
+        entry.expires_at = Some(deadline);
         Ok(true)
     }
 }
@@ -348,5 +352,32 @@ mod tests {
         let entries = store.entries.read().unwrap();
 
         assert!(!entries.contains_key(b"expired".as_slice()));
+    }
+
+    #[test]
+    fn expire_does_not_revive_expired_keys() {
+        let store = Store::new();
+
+        // Insert an already-expired entry.
+        {
+            let mut entries = store.entries.write().unwrap();
+
+            entries.insert(
+                b"stale".to_vec(),
+                Entry {
+                    value: b"old".to_vec(),
+                    expires_at: Some(Instant::now() - Duration::from_secs(1)),
+                },
+            );
+        }
+
+        // EXPIRE must not revive it.
+        assert!(!store.expire(b"stale", Duration::from_secs(60)).unwrap());
+
+        assert_eq!(store.get(b"stale").unwrap(), None);
+
+        // Verify physical cleanup.
+        let entries = store.entries.read().unwrap();
+        assert!(!entries.contains_key(b"stale".as_slice()));
     }
 }

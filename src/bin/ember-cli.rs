@@ -24,8 +24,24 @@ fn parse_command(input: &str) -> Result<Request, (ErrorCode, &'static str)> {
         [cmd, key] if cmd.eq_ignore_ascii_case("EXISTS") => Ok(Request::Exists {
             key: key.as_bytes().to_vec(),
         }),
+        [cmd, key, seconds] if cmd.eq_ignore_ascii_case("EXPIRE") => {
+            let seconds = seconds.parse::<i64>().map_err(|_| {
+                (
+                    ErrorCode::BadRequest,
+                    "expiration must be a valid signed 64-bit integer",
+                )
+            })?;
+
+            Ok(Request::Expire {
+                key: key.as_bytes().to_vec(),
+                seconds,
+            })
+        }
+        [cmd, key] if cmd.eq_ignore_ascii_case("TTL") => Ok(Request::Ttl {
+            key: key.as_bytes().to_vec(),
+        }),
         [cmd, ..]
-            if ["PING", "SET", "GET", "DEL", "EXISTS"]
+            if ["PING", "SET", "GET", "DEL", "EXISTS", "EXPIRE", "TTL"]
                 .iter()
                 .any(|known| cmd.eq_ignore_ascii_case(known)) =>
         {
@@ -133,6 +149,45 @@ mod tests {
         assert_eq!(
             parse_command("UNKNOWN"),
             Err((ErrorCode::NotImplemented, "unknown command"))
+        );
+    }
+
+    #[test]
+    fn parse_expiration_commands() {
+        assert_eq!(
+            parse_command("EXPIRE session 60"),
+            Ok(Request::Expire {
+                key: b"session".to_vec(),
+                seconds: 60,
+            })
+        );
+
+        assert_eq!(
+            parse_command("EXPIRE session -10"),
+            Ok(Request::Expire {
+                key: b"session".to_vec(),
+                seconds: -10,
+            })
+        );
+
+        assert_eq!(
+            parse_command("TTL session"),
+            Ok(Request::Ttl {
+                key: b"session".to_vec(),
+            })
+        );
+
+        assert_eq!(
+            parse_command("EXPIRE session abc"),
+            Err((
+                ErrorCode::BadRequest,
+                "expiration must be a valid signed 64-bit integer",
+            ))
+        );
+
+        assert_eq!(
+            parse_command("TTL"),
+            Err((ErrorCode::BadRequest, "invalid number of arguments",))
         );
     }
 }
