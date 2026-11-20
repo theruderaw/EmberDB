@@ -20,6 +20,8 @@ pub enum Request {
     Exists { key: Vec<u8> },
     Expire { key: Vec<u8>, seconds: i64 },
     Ttl { key: Vec<u8> },
+    Increment { key: Vec<u8> },
+    Decrement { key: Vec<u8> },
 }
 
 /// HTTP-equivalent error numbers. Success results have their own response tags.
@@ -174,6 +176,15 @@ pub fn encode_request(request: &Request) -> Result<Vec<u8>, CodecError> {
             out.push(0x07);
             append_blob(&mut out, key)?;
         }
+        Request::Increment { key } => {
+            out.push(0x08);
+            append_blob(&mut out, key)?;
+        }
+
+        Request::Decrement { key } => {
+            out.push(0x09);
+            append_blob(&mut out, key)?;
+        }
     }
     if out.len() > MAX_FRAME_SIZE {
         return Err(CodecError::TooLarge);
@@ -208,8 +219,13 @@ pub fn decode_request(data: &[u8]) -> Result<Request, CodecError> {
             key: read_blob(&mut input)?,
             seconds: read_i64(&mut input)?,
         },
-
         0x07 => Request::Ttl {
+            key: read_blob(&mut input)?,
+        },
+        0x08 => Request::Increment {
+            key: read_blob(&mut input)?,
+        },
+        0x09 => Request::Decrement {
             key: read_blob(&mut input)?,
         },
         _ => return Err(CodecError::UnknownOpcode),
@@ -297,6 +313,12 @@ mod tests {
                 key: b"negative".to_vec(),
                 seconds: -10,
             },
+            Request::Increment {
+                key: b"counter".to_vec(),
+            },
+            Request::Decrement {
+                key: b"counter".to_vec(),
+            },
         ];
         for command in commands {
             assert_eq!(
@@ -376,5 +398,21 @@ mod tests {
             value: vec![0; MAX_FRAME_SIZE],
         };
         assert_eq!(encode_request(&request), Err(CodecError::TooLarge));
+    }
+    #[test]
+    fn increment_decrement_wire_format() {
+        let incr = Request::Increment { key: b"x".to_vec() };
+
+        assert_eq!(
+            encode_request(&incr).unwrap(),
+            vec![VERSION, 0x08, 0, 0, 0, 1, b'x']
+        );
+
+        let decr = Request::Decrement { key: b"x".to_vec() };
+
+        assert_eq!(
+            encode_request(&decr).unwrap(),
+            vec![VERSION, 0x09, 0, 0, 0, 1, b'x']
+        );
     }
 }

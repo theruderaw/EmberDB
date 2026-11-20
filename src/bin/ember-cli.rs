@@ -40,10 +40,19 @@ fn parse_command(input: &str) -> Result<Request, (ErrorCode, &'static str)> {
         [cmd, key] if cmd.eq_ignore_ascii_case("TTL") => Ok(Request::Ttl {
             key: key.as_bytes().to_vec(),
         }),
+        [cmd, key] if cmd.eq_ignore_ascii_case("INCR") => Ok(Request::Increment {
+            key: key.as_bytes().to_vec(),
+        }),
+
+        [cmd, key] if cmd.eq_ignore_ascii_case("DECR") => Ok(Request::Decrement {
+            key: key.as_bytes().to_vec(),
+        }),
         [cmd, ..]
-            if ["PING", "SET", "GET", "DEL", "EXISTS", "EXPIRE", "TTL"]
-                .iter()
-                .any(|known| cmd.eq_ignore_ascii_case(known)) =>
+            if [
+                "PING", "SET", "GET", "DEL", "EXISTS", "EXPIRE", "TTL", "INCR", "DECR",
+            ]
+            .iter()
+            .any(|known| cmd.eq_ignore_ascii_case(known)) =>
         {
             Err((ErrorCode::BadRequest, "invalid number of arguments"))
         }
@@ -187,6 +196,28 @@ mod tests {
 
         assert_eq!(
             parse_command("TTL"),
+            Err((ErrorCode::BadRequest, "invalid number of arguments",))
+        );
+    }
+
+    #[test]
+    fn parse_counter_commands() {
+        assert_eq!(
+            parse_command("INCR counter"),
+            Ok(Request::Increment {
+                key: b"counter".to_vec(),
+            })
+        );
+
+        assert_eq!(
+            parse_command("decr counter"),
+            Ok(Request::Decrement {
+                key: b"counter".to_vec(),
+            })
+        );
+
+        assert_eq!(
+            parse_command("INCR"),
             Err((ErrorCode::BadRequest, "invalid number of arguments",))
         );
     }

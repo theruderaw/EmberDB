@@ -6,6 +6,7 @@ pub mod codec;
 pub mod command;
 pub mod config;
 pub mod connection;
+pub mod persistence;
 pub mod protocol;
 pub mod store;
 
