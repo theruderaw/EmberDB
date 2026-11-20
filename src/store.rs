@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 pub enum StoreError {
     LockPoisoned,
     InvalidExpiration,
+    InvalidInteger,
+    IntegerOverflow,
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +125,47 @@ impl Store {
             .ok_or(StoreError::InvalidExpiration)?;
         entry.expires_at = Some(deadline);
         Ok(true)
+    }
+
+    pub fn increment(&self, key: &[u8]) -> Result<i64, StoreError> {
+        self.change_by(key, 1)
+    }
+
+    pub fn decrement(&self, key: &[u8]) -> Result<i64, StoreError> {
+        self.change_by(key, -1)
+    }
+
+    fn change_by(&self, key: &[u8], delta: i64) -> Result<i64, StoreError> {
+        let mut entries = self.entries.write().map_err(|_| StoreError::LockPoisoned)?;
+
+        let (current, expires_at) = match entries.get(key).filter(|entry| !entry.is_expired()) {
+            Some(entry) => {
+                let text =
+                    std::str::from_utf8(&entry.value).map_err(|_| StoreError::InvalidInteger)?;
+
+                let number = text
+                    .parse::<i64>()
+                    .map_err(|_| StoreError::InvalidInteger)?;
+
+                (number, entry.expires_at)
+            }
+
+            None => (0, None),
+        };
+
+        let next = current
+            .checked_add(delta)
+            .ok_or(StoreError::IntegerOverflow)?;
+
+        entries.insert(
+            key.to_vec(),
+            Entry {
+                value: next.to_string().into_bytes(),
+                expires_at,
+            },
+        );
+
+        Ok(next)
     }
 }
 
@@ -379,5 +422,69 @@ mod tests {
         // Verify physical cleanup.
         let entries = store.entries.read().unwrap();
         assert!(!entries.contains_key(b"stale".as_slice()));
+    }
+
+    #[test]
+    fn increment_updates_integer_atomically() {
+        let store = Store::new();
+
+        assert_eq!(store.increment(b"counter").unwrap(), 1);
+        assert_eq!(store.increment(b"counter").unwrap(), 2);
+
+        assert_eq!(store.get(b"counter").unwrap(), Some(b"2".to_vec()));
+
+        store.set(b"counter".to_vec(), b"100".to_vec()).unwrap();
+
+        assert_eq!(store.increment(b"counter").unwrap(), 101);
+
+        store.set(b"counter".to_vec(), b"hello".to_vec()).unwrap();
+
+        assert!(matches!(
+            store.increment(b"counter"),
+            Err(StoreError::InvalidInteger)
+        ));
+
+        // Invalid increments must not overwrite the original value.
+        assert_eq!(store.get(b"counter").unwrap(), Some(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn decrement_and_integer_boundaries() {
+        let store = Store::new();
+
+        // A missing key starts at zero.
+        assert_eq!(store.decrement(b"counter").unwrap(), -1);
+        assert_eq!(store.decrement(b"counter").unwrap(), -2);
+        assert_eq!(store.increment(b"counter").unwrap(), -1);
+
+        // Maximum integer cannot be incremented.
+        store
+            .set(b"counter".to_vec(), i64::MAX.to_string().into_bytes())
+            .unwrap();
+
+        assert!(matches!(
+            store.increment(b"counter"),
+            Err(StoreError::IntegerOverflow)
+        ));
+
+        assert_eq!(
+            store.get(b"counter").unwrap(),
+            Some(i64::MAX.to_string().into_bytes())
+        );
+
+        // Minimum integer cannot be decremented.
+        store
+            .set(b"counter".to_vec(), i64::MIN.to_string().into_bytes())
+            .unwrap();
+
+        assert!(matches!(
+            store.decrement(b"counter"),
+            Err(StoreError::IntegerOverflow)
+        ));
+
+        assert_eq!(
+            store.get(b"counter").unwrap(),
+            Some(i64::MIN.to_string().into_bytes())
+        );
     }
 }

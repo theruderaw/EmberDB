@@ -4,6 +4,18 @@ use std::time::Duration;
 use crate::codec::{ErrorCode, Request, Response};
 use crate::store::{Store, StoreError, Ttl};
 
+fn counter_response(result: Result<i64, StoreError>) -> Response {
+    match result {
+        Ok(value) => Response::Integer(value),
+
+        Err(StoreError::InvalidInteger | StoreError::IntegerOverflow) => {
+            Response::Error(ErrorCode::BadRequest)
+        }
+
+        Err(_) => Response::Error(ErrorCode::InternalServerError),
+    }
+}
+
 pub fn execute(store: &Store, request: Request) -> Response {
     match request {
         Request::Ping => Response::Pong,
@@ -36,7 +48,7 @@ pub fn execute(store: &Store, request: Request) -> Response {
             match store.expire(&key, ttl) {
                 Ok(existed) => Response::Integer(i64::from(existed)),
                 Err(StoreError::InvalidExpiration) => Response::Error(ErrorCode::BadRequest),
-                Err(StoreError::LockPoisoned) => Response::Error(ErrorCode::InternalServerError),
+                Err(_) => Response::Error(ErrorCode::InternalServerError),
             }
         }
         Request::Ttl { key } => match store.ttl(&key) {
@@ -48,6 +60,8 @@ pub fn execute(store: &Store, request: Request) -> Response {
             },
             Err(_) => Response::Error(ErrorCode::InternalServerError),
         },
+        Request::Increment { key } => counter_response(store.increment(&key)),
+        Request::Decrement { key } => counter_response(store.decrement(&key)),
     }
 }
 
@@ -212,5 +226,86 @@ mod tests {
         );
 
         assert_eq!(execute(&store, Request::Ttl { key }), Response::Integer(-2));
+    }
+
+    #[test]
+    fn concurrent_increments_do_not_lose_updates() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const WORKERS: usize = 8;
+        const INCREMENTS_PER_WORKER: usize = 1_000;
+
+        let store = Arc::new(Store::new());
+        let mut handles = Vec::new();
+
+        for _ in 0..WORKERS {
+            let store = Arc::clone(&store);
+
+            let handle = thread::spawn(move || {
+                for _ in 0..INCREMENTS_PER_WORKER {
+                    store.increment(b"counter").unwrap();
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            handle.join().expect("worker panicked");
+        }
+
+        let expected = (WORKERS * INCREMENTS_PER_WORKER) as i64;
+
+        assert_eq!(
+            store.get(b"counter").unwrap(),
+            Some(expected.to_string().into_bytes())
+        );
+    }
+
+    #[test]
+    fn counter_commands_work() {
+        let store = Store::new();
+        let key = b"counter".to_vec();
+
+        // Missing key starts at zero.
+        assert_eq!(
+            execute(&store, Request::Increment { key: key.clone() }),
+            Response::Integer(1)
+        );
+
+        assert_eq!(
+            execute(&store, Request::Increment { key: key.clone() }),
+            Response::Integer(2)
+        );
+
+        assert_eq!(
+            execute(&store, Request::Decrement { key: key.clone() }),
+            Response::Integer(1)
+        );
+
+        // The result is stored as bytes.
+        assert_eq!(store.get(&key).unwrap(), Some(b"1".to_vec()));
+
+        // Non-integer values cannot be incremented.
+        store.set(key.clone(), b"hello".to_vec()).unwrap();
+
+        assert_eq!(
+            execute(&store, Request::Increment { key: key.clone() }),
+            Response::Error(ErrorCode::BadRequest)
+        );
+
+        // Failed mutation must preserve the original value.
+        assert_eq!(store.get(&key).unwrap(), Some(b"hello".to_vec()));
+
+        // Overflow must also return 400.
+        store
+            .set(key.clone(), i64::MAX.to_string().into_bytes())
+            .unwrap();
+
+        assert_eq!(
+            execute(&store, Request::Increment { key }),
+            Response::Error(ErrorCode::BadRequest)
+        );
     }
 }
