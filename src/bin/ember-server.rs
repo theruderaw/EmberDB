@@ -1,5 +1,6 @@
 use emberdb::{
     command::execute,
+    config::load_address,
     protocol::{read_frame, write_frame},
     store::Store,
 };
@@ -27,10 +28,12 @@ fn handle_client(mut stream: TcpStream, store: &Store) -> io::Result<()> {
 }
 
 fn main() -> io::Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:6380")?;
+    let address = load_address();
+    let listener = TcpListener::bind(address.as_str())?;
+
     let store = Arc::new(Store::new());
 
-    println!("Emberdb listening on 127.0.0.1:6380");
+    println!("Emberdb listening on {}", listener.local_addr()?);
 
     for connection in listener.incoming() {
         match connection {

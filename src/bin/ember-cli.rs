@@ -3,8 +3,11 @@ use std::{
     net::TcpStream,
 };
 
+use emberdb::config::load_address;
+
 fn main() -> io::Result<()> {
-    let stream = TcpStream::connect("127.0.0.1:6380")?;
+    let address = load_address();
+    let stream = TcpStream::connect(address)?;
     let mut server = BufReader::new(stream);
 
     println!("Connected to EmberDB");
