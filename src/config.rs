@@ -14,6 +14,7 @@ pub struct ServerConfig {
     pub bind_addr: String,
     pub read_timeout: Duration,
     pub write_timeout: Duration,
+    pub shutdown_timeout: Duration,
     pub max_clients: usize,
 }
 
@@ -93,6 +94,7 @@ impl ServerConfig {
             bind_addr: { load_address() },
             read_timeout: read_duration("EMBERDB_READ_TIMEOUT_SECS", 30)?,
             write_timeout: read_duration("EMBERDB_WRITE_TIMEOUT_SECS", 10)?,
+            shutdown_timeout: read_duration("EMBERDB_SHUTDOWN_TIMEOUT_SECS", 10)?,
             max_clients: read_positive_usize("EMBERDB_MAX_CLIENTS", 128)?,
         })
     }
