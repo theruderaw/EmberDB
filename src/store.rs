@@ -1,6 +1,6 @@
 //! Thread-safe, in-memory binary key/value storage.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,14 @@ pub enum StoreError {
     InvalidExpiration,
     InvalidInteger,
     IntegerOverflow,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum RestoreError {
+    UnsupportedVersion(u32),
+    DuplicateKey,
+    InvalidExpiration,
+    LockPoisoned,
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +188,65 @@ impl Store {
             version: SNAPSHOT_VERSION,
             entries: snapshot_entries,
         })
+    }
+
+    pub fn restore(&self, snapshot: &Snapshot) -> Result<(), RestoreError> {
+        // 1. Check snapshot compatibility.
+        if snapshot.version != SNAPSHOT_VERSION {
+            return Err(RestoreError::UnsupportedVersion(snapshot.version));
+        }
+
+        // 2. Capture the current wall-clock and monotonic times.
+        let now_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| RestoreError::InvalidExpiration)?
+            .as_millis();
+
+        let now = Instant::now();
+
+        // 3. Build the replacement database independently.
+        let mut restored = HashMap::with_capacity(snapshot.entries.len());
+        let mut seen = HashSet::with_capacity(snapshot.entries.len());
+
+        for item in &snapshot.entries {
+            if !seen.insert(item.key.clone()) {
+                return Err(RestoreError::DuplicateKey);
+            }
+
+            let expires_at = match item.expires_at_unix_ms {
+                None => None,
+                Some(timestamp) if u128::from(timestamp) <= now_unix_ms => {
+                    continue;
+                }
+                Some(timestamp) => {
+                    let remaining_ms = u64::try_from(u128::from(timestamp) - now_unix_ms)
+                        .map_err(|_| RestoreError::InvalidExpiration)?;
+
+                    let deadline = now
+                        .checked_add(Duration::from_millis(remaining_ms))
+                        .ok_or(RestoreError::InvalidExpiration)?;
+
+                    Some(deadline)
+                }
+            };
+
+            restored.insert(
+                item.key.clone(),
+                Entry {
+                    value: item.value.clone(),
+                    expires_at,
+                },
+            );
+        }
+
+        let mut entries = self
+            .entries
+            .write()
+            .map_err(|_| RestoreError::LockPoisoned)?;
+
+        *entries = restored;
+
+        Ok(())
     }
 
     fn change_by(&self, key: &[u8], delta: i64) -> Result<i64, StoreError> {
@@ -585,5 +652,103 @@ mod tests {
 
         // Expired entries must not enter the snapshot.
         assert!(!snapshot.entries.iter().any(|entry| entry.key == b"stale"));
+    }
+
+    #[test]
+    fn restore_preserves_remaining_ttl() {
+        let store = Store::new();
+
+        // Create an expiration timestamp 60 seconds
+        // into the future, expressed as Unix milliseconds.
+        let expires_at = SystemTime::now()
+            .checked_add(Duration::from_secs(60))
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis();
+
+        let snapshot = Snapshot {
+            version: SNAPSHOT_VERSION,
+            entries: vec![SnapshotEntry {
+                key: b"temporary".to_vec(),
+                value: b"hello".to_vec(),
+                expires_at_unix_ms: Some(u64::try_from(expires_at).unwrap()),
+            }],
+        };
+
+        store.restore(&snapshot).unwrap();
+
+        assert_eq!(store.get(b"temporary").unwrap(), Some(b"hello".to_vec()));
+
+        match store.ttl(b"temporary").unwrap() {
+            Ttl::ExpiresIn(remaining) => {
+                assert!(remaining > Duration::from_secs(55));
+                assert!(remaining <= Duration::from_secs(60));
+            }
+            other => panic!("Expected an expiring key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_snapshot_preserves_existing_data() {
+        let store = Store::new();
+
+        store.set(b"original".to_vec(), b"safe".to_vec()).unwrap();
+
+        let snapshot = Snapshot {
+            version: SNAPSHOT_VERSION,
+            entries: vec![
+                SnapshotEntry {
+                    key: b"duplicate".to_vec(),
+                    value: b"first".to_vec(),
+                    expires_at_unix_ms: None,
+                },
+                SnapshotEntry {
+                    key: b"duplicate".to_vec(),
+                    value: b"second".to_vec(),
+                    expires_at_unix_ms: None,
+                },
+            ],
+        };
+
+        assert_eq!(store.restore(&snapshot), Err(RestoreError::DuplicateKey));
+
+        // The original database must remain unchanged.
+        assert_eq!(store.get(b"original").unwrap(), Some(b"safe".to_vec()));
+
+        assert_eq!(store.get(b"duplicate").unwrap(), None);
+    }
+    #[test]
+    fn restore_replaces_existing_data() {
+        let store = Store::new();
+
+        store.set(b"old".to_vec(), b"previous".to_vec()).unwrap();
+
+        let snapshot = Snapshot {
+            version: SNAPSHOT_VERSION,
+            entries: vec![
+                SnapshotEntry {
+                    key: b"counter".to_vec(),
+                    value: b"42".to_vec(),
+                    expires_at_unix_ms: None,
+                },
+                SnapshotEntry {
+                    key: b"expired".to_vec(),
+                    value: b"stale".to_vec(),
+                    expires_at_unix_ms: Some(1),
+                },
+            ],
+        };
+
+        store.restore(&snapshot).unwrap();
+
+        // The snapshot replaces the old database.
+        assert_eq!(store.get(b"old").unwrap(), None);
+
+        // Persistent entries are restored.
+        assert_eq!(store.get(b"counter").unwrap(), Some(b"42".to_vec()));
+
+        // Expired entries are skipped.
+        assert_eq!(store.get(b"expired").unwrap(), None);
     }
 }
