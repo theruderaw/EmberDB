@@ -2,15 +2,17 @@ use emberdb::codec::{CodecError, ErrorCode, Response, decode_request, encode_res
 use emberdb::command::execute;
 use emberdb::config::{AppConfig, ServerConfig};
 use emberdb::connection::ConnectionLimiter;
+use emberdb::persistence::{load_snapshot, save_snapshot};
 use emberdb::protocol::{read_frame, write_frame};
 use emberdb::store::Store;
 
 use std::io::{self, ErrorKind};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
 use std::time::{Duration, Instant};
+use std::{fs, thread};
 
 fn send_response(stream: &mut TcpStream, response: &Response) -> io::Result<()> {
     let payload = encode_response(response).map_err(|error| {
@@ -86,8 +88,27 @@ fn handle_client(
 fn main() -> io::Result<()> {
     // Configuration and shared server resources.
     let app_config = AppConfig::load()?;
-    let config = Arc::new(app_config.server);
+    let snapshot_path = app_config.persistence.snapshot_path.clone();
     let store = Arc::new(Store::new());
+
+    match load_snapshot(&snapshot_path)? {
+        Some(snapshot) => {
+            store.restore(&snapshot).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("snapshot restoration failed {error:?}"),
+                )
+            })?;
+
+            println!("EmberDB snapshot restored successfully");
+        }
+
+        None => {
+            println!("No existing snapshot; starting with empty database");
+        }
+    }
+
+    let config = Arc::new(app_config.server);
 
     let limiter = Arc::new(ConnectionLimiter::new(config.max_clients));
 
@@ -198,9 +219,28 @@ fn main() -> io::Result<()> {
     }
 
     if limiter.active() == 0 {
-        println!("All client connections closed")
+        println!("All client connections closed");
+
+        let snapshot = store
+            .snapshot()
+            .map_err(|error| io::Error::other(format!("snapshot creation failed: {error:?}")))?;
+
+        let parent = snapshot_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+
+        fs::create_dir_all(parent)?;
+
+        save_snapshot(&snapshot_path, &snapshot)?;
+
+        println!(
+            "Snapshot saved: {} entries to {}",
+            snapshot.entries.len(),
+            snapshot_path.display()
+        )
     } else {
-        eprintln!("Exiting with active connections")
+        eprintln!("Exiting with active connections; snapshot skipped to avoid concurrent writes")
     }
     println!("EmberDB shutdown complete");
 
