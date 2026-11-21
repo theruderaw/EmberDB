@@ -8,8 +8,7 @@
 //! These numeric statuses are inspired by HTTP; this is NOT HTTP.
 
 use crate::protocol::MAX_FRAME_SIZE;
-
-pub const VERSION: u8 = 2;
+pub use crate::version::PROTOCOL_VERSION as VERSION;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
