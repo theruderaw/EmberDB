@@ -1,0 +1,12 @@
+{
+  "server": {
+    "bind_addr": "127.0.0.1:6380",
+    "max_clients": 128,
+    "read_timeout_secs": 30,
+    "write_timeout_secs": 10,
+    "shutdown_timeout_secs": 10
+  },
+  "persistence": {
+    "snapshot_path": "./data/snapshot.json"
+  }
+}

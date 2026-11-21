@@ -1,6 +1,6 @@
 use emberdb::codec::{CodecError, ErrorCode, Response, decode_request, encode_response};
 use emberdb::command::execute;
-use emberdb::config::ServerConfig;
+use emberdb::config::{AppConfig, ServerConfig};
 use emberdb::connection::ConnectionLimiter;
 use emberdb::protocol::{read_frame, write_frame};
 use emberdb::store::Store;
@@ -85,7 +85,8 @@ fn handle_client(
 
 fn main() -> io::Result<()> {
     // Configuration and shared server resources.
-    let config = Arc::new(ServerConfig::from_env()?);
+    let app_config = AppConfig::load()?;
+    let config = Arc::new(app_config.server);
     let store = Arc::new(Store::new());
 
     let limiter = Arc::new(ConnectionLimiter::new(config.max_clients));

@@ -9,6 +9,7 @@ pub mod connection;
 pub mod persistence;
 pub mod protocol;
 pub mod store;
+pub mod version;
 
 #[cfg(test)]
 mod tests {

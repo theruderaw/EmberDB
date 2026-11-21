@@ -1,5 +1,5 @@
 use emberdb::codec::{CodecError, ErrorCode, Request, Response, decode_response, encode_request};
-use emberdb::config::load_address;
+use emberdb::config::AppConfig;
 use emberdb::protocol::{read_frame, write_frame};
 
 use std::io::{self, ErrorKind, Write};
@@ -77,7 +77,7 @@ fn display_response(response: Response) {
 }
 
 fn main() -> io::Result<()> {
-    let address = load_address();
+    let address = AppConfig::load()?.server.bind_addr;
     let mut stream = TcpStream::connect(&*address)?;
     println!("Connected to EmberDB at {address}");
     println!("Type QUIT to exit.");

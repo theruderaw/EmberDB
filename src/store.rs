@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::persistence::{SNAPSHOT_VERSION, Snapshot, SnapshotEntry};
 
 #[derive(Debug)]
 pub enum StoreError {
@@ -133,6 +135,51 @@ impl Store {
 
     pub fn decrement(&self, key: &[u8]) -> Result<i64, StoreError> {
         self.change_by(key, -1)
+    }
+
+    pub fn snapshot(&self) -> Result<Snapshot, StoreError> {
+        let entries = self.entries.read().map_err(|_| StoreError::LockPoisoned)?;
+
+        let now = Instant::now();
+        let wall_now = SystemTime::now();
+
+        let mut snapshot_entries = Vec::with_capacity(entries.len());
+
+        for (key, entry) in entries.iter() {
+            let expires_at_unix_ms = match entry.expires_at {
+                None => None,
+
+                Some(deadline) => {
+                    if deadline <= now {
+                        continue;
+                    }
+
+                    let remaining = deadline.duration_since(now);
+
+                    let absolute = wall_now
+                        .checked_add(remaining)
+                        .ok_or(StoreError::InvalidExpiration)?;
+
+                    let milliseconds = absolute
+                        .duration_since(UNIX_EPOCH)
+                        .map_err(|_| StoreError::InvalidExpiration)?
+                        .as_millis();
+
+                    Some(u64::try_from(milliseconds).map_err(|_| StoreError::InvalidExpiration)?)
+                }
+            };
+
+            snapshot_entries.push(SnapshotEntry {
+                key: key.clone(),
+                value: entry.value.clone(),
+                expires_at_unix_ms,
+            });
+        }
+
+        Ok(Snapshot {
+            version: SNAPSHOT_VERSION,
+            entries: snapshot_entries,
+        })
     }
 
     fn change_by(&self, key: &[u8], delta: i64) -> Result<i64, StoreError> {
@@ -486,5 +533,57 @@ mod tests {
             store.get(b"counter").unwrap(),
             Some(i64::MIN.to_string().into_bytes())
         );
+    }
+
+    #[test]
+    fn snapshot_exports_live_entries() {
+        let store = Store::new();
+
+        store
+            .set(b"persistent".to_vec(), b"hello".to_vec())
+            .unwrap();
+
+        store.set(b"temporary".to_vec(), b"world".to_vec()).unwrap();
+
+        store.expire(b"temporary", Duration::from_secs(60)).unwrap();
+
+        // Insert an already-expired entry.
+        {
+            let mut entries = store.entries.write().unwrap();
+
+            entries.insert(
+                b"stale".to_vec(),
+                Entry {
+                    value: b"old".to_vec(),
+                    expires_at: Some(Instant::now() - Duration::from_secs(1)),
+                },
+            );
+        }
+
+        let snapshot = store.snapshot().unwrap();
+
+        assert_eq!(snapshot.version, SNAPSHOT_VERSION);
+        assert_eq!(snapshot.entries.len(), 2);
+
+        let persistent = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == b"persistent")
+            .unwrap();
+
+        assert_eq!(persistent.value, b"hello");
+        assert_eq!(persistent.expires_at_unix_ms, None);
+
+        let temporary = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.key == b"temporary")
+            .unwrap();
+
+        assert_eq!(temporary.value, b"world");
+        assert!(temporary.expires_at_unix_ms.is_some());
+
+        // Expired entries must not enter the snapshot.
+        assert!(!snapshot.entries.iter().any(|entry| entry.key == b"stale"));
     }
 }
