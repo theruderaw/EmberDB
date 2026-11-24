@@ -5,6 +5,7 @@ use emberdb::connection::ConnectionLimiter;
 use emberdb::persistence::{load_snapshot, save_snapshot};
 use emberdb::protocol::{read_frame, write_frame};
 use emberdb::store::Store;
+use emberdb::wal::lock::acquire_persistence_locks;
 
 use std::io::{self, ErrorKind};
 use std::net::{TcpListener, TcpStream};
@@ -88,6 +89,11 @@ fn handle_client(
 fn main() -> io::Result<()> {
     // Configuration and shared server resources.
     let app_config = AppConfig::load()?;
+    let _persistence_locks = acquire_persistence_locks(
+        &app_config.persistence.snapshot_path,
+        &app_config.persistence.wal.path,
+    );
+    println!("Exclusive persistence locks acquired");
     let snapshot_path = app_config.persistence.snapshot_path.clone();
     let store = Arc::new(Store::new());
 
