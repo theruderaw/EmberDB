@@ -2,12 +2,16 @@
 //!
 //! Each test starts a real ember-server on an ephemeral loopback port. The
 //! server is terminated automatically, including when a test panics.
+mod common;
+
+use common::isolated_server_command;
+use tempfile::TempDir;
 
 use emberdb::codec::{ErrorCode, Request, Response, decode_response, encode_request};
 use emberdb::protocol::{read_frame, write_frame};
 
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +23,7 @@ const IO_TIMEOUT: Duration = Duration::from_secs(3);
 
 struct TestServer {
     child: Child,
+    _directory: TempDir,
 }
 
 impl Drop for TestServer {
@@ -44,18 +49,18 @@ fn start_server() -> (TestServer, TcpStream) {
     let address: SocketAddr = probe.local_addr().expect("failed to get test address");
     drop(probe);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ember-server"))
-        .env("EMBERDB_ADDR", address.to_string())
-        .env("EMBERDB_MAX_CLIENTS", "16")
-        .env("EMBERDB_READ_TIMEOUT_SECS", "30")
-        .env("EMBERDB_WRITE_TIMEOUT_SECS", "5")
-        .env("EMBERDB_SHUTDOWN_TIMEOUT_SECS", "2")
+    let (directory, mut command) = isolated_server_command(address, 16, 30, 5, 2);
+
+    let child = command
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .expect("failed to launch ember-server");
 
-    let mut server = TestServer { child };
+    let mut server = TestServer {
+        child,
+        _directory: directory,
+    };
     let ping = encode_request(&Request::Ping).expect("PING must encode");
 
     for _ in 0..STARTUP_RETRIES {
