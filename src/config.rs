@@ -1,9 +1,12 @@
 use serde::Deserialize;
+use serde::Serialize;
 use std::env;
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::PathBuf;
 use std::time::Duration;
+
+use crate::config::WalSyncMode::Always;
 
 // Runtime configuration used by the TCP server.
 #[derive(Debug, Clone)]
@@ -15,10 +18,38 @@ pub struct ServerConfig {
     pub shutdown_timeout: Duration,
 }
 
+pub const WAL_CHECKPOINT_THRESHOLD_BYTES: u64 = 16 * 1024;
+pub const WAL_MAX_SIZE_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum WalSyncMode {
+    #[default]
+    Always,
+    Group,
+    Periodic,
+    Os,
+}
+
+#[derive(Debug, Clone)]
+pub struct GroupCommitConfig {
+    pub max_batch_size: usize,
+    pub max_wait: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalConfig {
+    pub path: PathBuf,
+    pub sync_mode: WalSyncMode,
+    pub sync_interval: Duration,
+    pub group_commit: GroupCommitConfig,
+}
+
 // Runtime persistence configuration.
 #[derive(Debug, Clone)]
 pub struct PersistenceConfig {
     pub snapshot_path: PathBuf,
+    pub wal: WalConfig,
 }
 
 // Root application configuration.
@@ -47,6 +78,86 @@ struct ServerSettings {
 #[derive(Debug, Deserialize)]
 struct PersistenceSettings {
     snapshot_path: PathBuf,
+
+    #[serde(default)]
+    wal: WalSettings,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct WalSettings {
+    path: Option<PathBuf>,
+    sync_mode: WalSyncMode,
+    sync_interval_ms: u64,
+    group_commit: GroupCommitSettings,
+}
+
+impl Default for WalSettings {
+    fn default() -> Self {
+        Self {
+            path: None,
+            sync_mode: Always,
+            sync_interval_ms: 1000,
+            group_commit: GroupCommitSettings::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct GroupCommitSettings {
+    max_batch_size: usize,
+    max_wait_ms: u64,
+}
+
+impl Default for GroupCommitSettings {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 64,
+            max_wait_ms: 5,
+        }
+    }
+}
+
+fn load_wal_config(persistence: &PersistenceSettings) -> io::Result<WalConfig> {
+    let settings = &persistence.wal;
+
+    let path = settings
+        .path
+        .clone()
+        .unwrap_or_else(|| persistence.snapshot_path.with_file_name("wal.log"));
+    if path.as_os_str().is_empty() {
+        return Err(invalid_config("persistence.wal.path must not be empty"));
+    }
+
+    if path == persistence.snapshot_path {
+        return Err(invalid_config("WAL and snapshot paths must be different"));
+    }
+    if settings.sync_interval_ms == 0 {
+        return Err(invalid_config(
+            "persistence.wal.sync_interval_ms must be greater than 0",
+        ));
+    }
+    if settings.group_commit.max_batch_size == 0 {
+        return Err(invalid_config(
+            "persistence.wal.group_commit.max_batch_size must be greater than zero",
+        ));
+    }
+
+    if settings.group_commit.max_wait_ms == 0 {
+        return Err(invalid_config(
+            "persistence.wal.group_commit.max_wait_ms must be greater than zero",
+        ));
+    }
+    Ok(WalConfig {
+        path,
+        sync_mode: settings.sync_mode,
+        sync_interval: Duration::from_millis(settings.sync_interval_ms),
+        group_commit: GroupCommitConfig {
+            max_batch_size: settings.group_commit.max_batch_size,
+            max_wait: Duration::from_millis(settings.group_commit.max_wait_ms),
+        },
+    })
 }
 
 impl AppConfig {
@@ -98,6 +209,8 @@ impl AppConfig {
             ));
         }
 
+        let wal = load_wal_config(&persistence)?;
+
         Ok(Self {
             server: ServerConfig {
                 bind_addr,
@@ -109,6 +222,7 @@ impl AppConfig {
 
             persistence: PersistenceConfig {
                 snapshot_path: persistence.snapshot_path,
+                wal,
             },
         })
     }

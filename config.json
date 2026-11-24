@@ -7,6 +7,15 @@
     "shutdown_timeout_secs": 10
   },
   "persistence": {
-    "snapshot_path": "./data/snapshot.json"
+    "snapshot_path": "./data/snapshot.json",
+    "wal":{
+        "path":"./data/wal.log",
+        "sync_mode":"always",
+        "sync_interval_ms":1000,
+        "group_commit":{
+            "max_batch_size": 64,
+            "max_wait_ms": 5
+        }
+    }
   }
 }

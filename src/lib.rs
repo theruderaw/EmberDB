@@ -10,6 +10,7 @@ pub mod persistence;
 pub mod protocol;
 pub mod store;
 pub mod version;
+pub mod wal;
 
 #[cfg(test)]
 mod tests {
