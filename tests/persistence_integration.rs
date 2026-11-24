@@ -186,7 +186,9 @@ QUIT
     let snapshot: serde_json::Value =
         serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
 
-    assert_eq!(snapshot["version"], 1);
+    assert_eq!(snapshot["version"], emberdb::version::SNAPSHOT_VERSION);
+
+    assert_eq!(snapshot["last_sequence"], 0);
     assert!(snapshot["entries"].is_array());
 
     // Ensure the short-lived key expires.

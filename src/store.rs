@@ -146,6 +146,10 @@ impl Store {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot, StoreError> {
+        self.snapshot_at_sequence(0)
+    }
+
+    pub fn snapshot_at_sequence(&self, last_sequence: u64) -> Result<Snapshot, StoreError> {
         let entries = self.entries.read().map_err(|_| StoreError::LockPoisoned)?;
 
         let now = Instant::now();
@@ -186,6 +190,7 @@ impl Store {
 
         Ok(Snapshot {
             version: SNAPSHOT_VERSION,
+            last_sequence,
             entries: snapshot_entries,
         })
     }
@@ -674,6 +679,8 @@ mod tests {
                 value: b"hello".to_vec(),
                 expires_at_unix_ms: Some(u64::try_from(expires_at).unwrap()),
             }],
+
+            last_sequence: 0,
         };
 
         store.restore(&snapshot).unwrap();
@@ -709,6 +716,7 @@ mod tests {
                     expires_at_unix_ms: None,
                 },
             ],
+            last_sequence: 0,
         };
 
         assert_eq!(store.restore(&snapshot), Err(RestoreError::DuplicateKey));
@@ -738,6 +746,7 @@ mod tests {
                     expires_at_unix_ms: Some(1),
                 },
             ],
+            last_sequence: 0,
         };
 
         store.restore(&snapshot).unwrap();
@@ -750,5 +759,17 @@ mod tests {
 
         // Expired entries are skipped.
         assert_eq!(store.get(b"expired").unwrap(), None);
+    }
+    #[test]
+    fn snapshot_captures_wal_sequence() {
+        let store = Store::new();
+
+        store.set(b"counter".to_vec(), b"100".to_vec()).unwrap();
+
+        let snapshot = store.snapshot_at_sequence(42).unwrap();
+
+        assert_eq!(snapshot.version, SNAPSHOT_VERSION);
+        assert_eq!(snapshot.last_sequence, 42);
+        assert_eq!(snapshot.entries.len(), 1);
     }
 }
