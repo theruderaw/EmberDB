@@ -3,59 +3,26 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+mod common;
 
-use serde_json::json;
+use common::{configure_process, isolated_server_command};
+use tempfile::TempDir;
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn create_config(directory: &Path) -> (PathBuf, String) {
-    // Reserve an available local port, then release it.
+fn create_server() -> (TempDir, Command, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap().to_string();
+    let address = listener.local_addr().unwrap();
     drop(listener);
 
-    let config_path = directory.join("config.json");
-    let snapshot_path = directory.join("snapshot.json");
+    let (directory, command) = isolated_server_command(address, 16, 30, 5, 5);
 
-    let config = json!({
-        "server": {
-            "bind_addr": address,
-            "max_clients": 16,
-            "read_timeout_secs": 30,
-            "write_timeout_secs": 5,
-            "shutdown_timeout_secs": 5
-        },
-        "persistence": {
-            "snapshot_path": snapshot_path
-        }
-    });
-
-    fs::write(&config_path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
-
-    (config_path, address)
-}
-
-fn configure_process(command: &mut Command, config: &Path) {
-    command
-        .current_dir(config.parent().unwrap())
-        .env("EMBERDB_CONFIG_PATH", config);
-
-    // Prevent inherited environment overrides from
-    // interfering with the test configuration.
-    for variable in [
-        "EMBERDB_ADDR",
-        "EMBERDB_MAX_CLIENTS",
-        "EMBERDB_READ_TIMEOUT_SECS",
-        "EMBERDB_WRITE_TIMEOUT_SECS",
-        "EMBERDB_SHUTDOWN_TIMEOUT_SECS",
-    ] {
-        command.env_remove(variable);
-    }
+    (directory, command, address.to_string())
 }
 
 fn wait_for_exit(child: &mut Child) -> ExitStatus {
@@ -80,10 +47,7 @@ struct TestServer {
 }
 
 impl TestServer {
-    fn spawn(config: &Path) -> Self {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ember-server"));
-        configure_process(&mut command, config);
-
+    fn spawn(mut command: Command) -> Self {
         let child = command
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -179,11 +143,11 @@ fn run_cli(config: &Path, commands: &str) -> Vec<String> {
 
 #[test]
 fn snapshot_survives_graceful_restart() {
-    let directory = tempfile::tempdir().unwrap();
-    let (config, address) = create_config(directory.path());
+    let (directory, command, address) = create_server();
+    let config = directory.path().join("config.json");
 
     // First server process.
-    let mut server = TestServer::spawn(&config);
+    let mut server = TestServer::spawn(command);
     server.wait_until_ready(&address);
 
     let responses = run_cli(
@@ -230,7 +194,11 @@ QUIT
 
     // A completely new server process must restore
     // the persisted database.
-    let mut restored = TestServer::spawn(&config);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ember-server"));
+
+    configure_process(&mut command, &config);
+
+    let mut restored = TestServer::spawn(command);
     restored.wait_until_ready(&address);
 
     let responses = run_cli(
@@ -270,16 +238,12 @@ QUIT
 
 #[test]
 fn corrupt_snapshot_prevents_server_startup() {
-    let directory = tempfile::tempdir().unwrap();
-    let (config, _address) = create_config(directory.path());
+    let (directory, mut command, _address) = create_server();
 
     let snapshot_path = directory.path().join("snapshot.json");
 
     // Write an intentionally malformed snapshot.
     fs::write(&snapshot_path, b"{ invalid json").unwrap();
-
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ember-server"));
-    configure_process(&mut command, &config);
 
     let mut server = TestServer {
         child: command

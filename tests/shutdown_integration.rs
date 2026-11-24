@@ -2,6 +2,10 @@
 
 //! End-to-end shutdown tests for EmberDB.
 //! Uses POSIX SIGINT to simulate Ctrl+C.
+mod common;
+
+use common::isolated_server_command;
+use tempfile::TempDir;
 
 use emberdb::codec::{Request, Response, decode_response, encode_request};
 use emberdb::protocol::{read_frame, write_frame};
@@ -16,6 +20,7 @@ const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 struct TestServer {
     child: Child,
+    _directory: TempDir,
 }
 
 impl Drop for TestServer {
@@ -78,21 +83,19 @@ fn start_server(read_timeout_secs: u64, shutdown_timeout_secs: u64) -> (TestServ
     let address: SocketAddr = probe.local_addr().unwrap();
     drop(probe);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ember-server"))
-        .env("EMBERDB_ADDR", address.to_string())
-        .env("EMBERDB_MAX_CLIENTS", "8")
-        .env("EMBERDB_READ_TIMEOUT_SECS", read_timeout_secs.to_string())
-        .env("EMBERDB_WRITE_TIMEOUT_SECS", "5")
-        .env(
-            "EMBERDB_SHUTDOWN_TIMEOUT_SECS",
-            shutdown_timeout_secs.to_string(),
-        )
+    let (directory, mut command) =
+        isolated_server_command(address, 8, read_timeout_secs, 5, shutdown_timeout_secs);
+
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start EmberDB");
 
-    let mut server = TestServer { child };
+    let mut server = TestServer {
+        child,
+        _directory: directory,
+    };
 
     // Don't just verify that TCP connect succeeds:
     // complete a PING/PONG exchange to prove that

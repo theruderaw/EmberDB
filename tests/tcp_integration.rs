@@ -2,13 +2,17 @@
 //!
 //! These tests launch an actual ember-server process. Each test uses its own
 //! ephemeral TCP port so tests can run in parallel without port conflicts.
+mod common;
+
+use common::isolated_server_command;
+use tempfile::TempDir;
 
 use emberdb::codec::{ErrorCode, Request, Response, VERSION, decode_response, encode_request};
 use emberdb::protocol::{MAX_FRAME_SIZE, read_frame, write_frame};
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::thread;
 use std::time::Duration;
 
@@ -19,6 +23,7 @@ const RETRY_DELAY: Duration = Duration::from_millis(20);
 /// Own the child server process and terminate it even if a test panics.
 struct TestServer {
     child: Child,
+    _directory: TempDir,
 }
 
 impl Drop for TestServer {
@@ -37,16 +42,17 @@ fn start_server_with_limit(max_clients: usize) -> (TestServer, SocketAddr) {
     let address = probe.local_addr().expect("failed to read test port");
     drop(probe);
 
-    let child = Command::new(env!("CARGO_BIN_EXE_ember-server"))
-        .env("EMBERDB_ADDR", address.to_string())
-        .env("EMBERDB_MAX_CLIENTS", max_clients.to_string())
-        .env("EMBERDB_READ_TIMEOUT_SECS", "30")
-        .env("EMBERDB_WRITE_TIMEOUT_SECS", "5")
+    let (directory, mut command) = isolated_server_command(address, max_clients, 30, 5, 10);
+
+    let child = command
         .stdout(Stdio::null())
         .spawn()
         .expect("failed to launch ember-server");
 
-    let mut server = TestServer { child };
+    let mut server = TestServer {
+        child,
+        _directory: directory,
+    };
 
     // A successful TCP connection means the listening socket is ready.
     // This probe briefly occupies a connection slot. Tests that enforce a
