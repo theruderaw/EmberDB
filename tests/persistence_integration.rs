@@ -1,5 +1,8 @@
 #![cfg(unix)]
 
+use emberdb::codec::{Request, encode_request};
+use emberdb::persistence::load_snapshot;
+use emberdb::wal::record::{RecordKind, WalRecord};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -49,8 +52,8 @@ struct TestServer {
 impl TestServer {
     fn spawn(mut command: Command) -> Self {
         let child = command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("failed to start EmberDB");
 
@@ -275,4 +278,75 @@ fn corrupt_snapshot_prevents_server_startup() {
 
     // Startup must not overwrite the damaged snapshot.
     assert_eq!(fs::read(&snapshot_path).unwrap(), b"{ invalid json");
+}
+
+#[test]
+fn wal_recovery_survives_restart_without_duplicate_replay() {
+    let (directory, command, address) = create_server();
+
+    let config = directory.path().join("config.json");
+    let snapshot_path = directory.path().join("snapshot.json");
+    let wal_path = directory.path().join("wal.log");
+
+    let requests = [
+        Request::Set {
+            key: b"counter".to_vec(),
+            value: b"10".to_vec(),
+        },
+        Request::Increment {
+            key: b"counter".to_vec(),
+        },
+    ];
+
+    let mut wal_bytes = Vec::new();
+
+    for (index, request) in requests.iter().enumerate() {
+        let record = WalRecord {
+            kind: RecordKind::Command,
+            sequence: index as u64 + 1,
+            timestamp_unix_ms: 1000 + index as u64,
+            transaction_id: 0,
+            payload: encode_request(request).unwrap(),
+        };
+
+        wal_bytes.extend_from_slice(&record.encode().unwrap());
+    }
+
+    fs::write(&wal_path, &wal_bytes).unwrap();
+
+    // First startup: recover from the WAL alone.
+    let mut server = TestServer::spawn(command);
+    server.wait_until_ready(&address);
+
+    assert_eq!(run_cli(&config, "GET counter\nQUIT\n"), ["VALUE 11"],);
+
+    server.shutdown();
+
+    // Graceful shutdown must preserve the recovered sequence.
+    let snapshot = load_snapshot(&snapshot_path).unwrap().unwrap();
+
+    assert_eq!(snapshot.last_sequence, 2);
+    assert_eq!(snapshot.entries.len(), 1);
+    assert_eq!(snapshot.entries[0].key, b"counter");
+    assert_eq!(snapshot.entries[0].value, b"11");
+
+    // Recovery must not modify the WAL.
+    assert_eq!(fs::read(&wal_path).unwrap(), wal_bytes,);
+
+    // Second startup: snapshot + previously replayed WAL.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_ember-server"));
+
+    configure_process(&mut command, &config);
+
+    let mut restored = TestServer::spawn(command);
+    restored.wait_until_ready(&address);
+
+    assert_eq!(run_cli(&config, "GET counter\nQUIT\n"), ["VALUE 11"],);
+
+    restored.shutdown();
+
+    let snapshot = load_snapshot(&snapshot_path).unwrap().unwrap();
+
+    assert_eq!(snapshot.last_sequence, 2);
+    assert_eq!(snapshot.entries[0].value, b"11");
 }

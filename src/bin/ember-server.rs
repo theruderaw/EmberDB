@@ -2,17 +2,18 @@ use emberdb::codec::{CodecError, ErrorCode, Response, decode_request, encode_res
 use emberdb::command::execute;
 use emberdb::config::{AppConfig, ServerConfig};
 use emberdb::connection::ConnectionLimiter;
-use emberdb::persistence::{load_snapshot, save_snapshot};
+use emberdb::persistence::save_snapshot;
 use emberdb::protocol::{read_frame, write_frame};
 use emberdb::store::Store;
 use emberdb::wal::lock::acquire_persistence_locks;
+use emberdb::wal::recovery::recover;
 
 use std::io::{self, ErrorKind};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, thread};
 
 fn send_response(stream: &mut TcpStream, response: &Response) -> io::Result<()> {
@@ -92,27 +93,47 @@ fn main() -> io::Result<()> {
     let _persistence_locks = acquire_persistence_locks(
         &app_config.persistence.snapshot_path,
         &app_config.persistence.wal.path,
-    );
+    )?;
     println!("Exclusive persistence locks acquired");
+
     let snapshot_path = app_config.persistence.snapshot_path.clone();
+    let wal_path = app_config.persistence.wal.path.clone();
+
+    let recovery_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_millis();
+
+    let recovery_timestamp = u64::try_from(recovery_timestamp).map_err(io::Error::other)?;
+
+    let recovery = recover(&snapshot_path, &wal_path, recovery_timestamp)?;
+
+    let last_sequence = recovery.snapshot.last_sequence;
+
     let store = Arc::new(Store::new());
 
-    match load_snapshot(&snapshot_path)? {
-        Some(snapshot) => {
-            store.restore(&snapshot).map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("snapshot restoration failed {error:?}"),
-                )
-            })?;
+    store.restore(&recovery.snapshot).map_err(|error| {
+        io::Error::new(
+            ErrorKind::InvalidData,
+            format!("recovered data restoration failed: {error:?}"),
+        )
+    })?;
 
-            println!("EmberDB snapshot restored successfully");
-        }
+    println!(
+        "Recovery complete: {} entries, {} replayed commands, last sequence {}",
+        recovery.snapshot.entries.len(),
+        recovery.replayed_commands,
+        last_sequence,
+    );
 
-        None => {
-            println!("No existing snapshot; starting with empty database");
-        }
+    if recovery.wal.has_incomplete_tail() {
+        eprintln!(
+            "WAL contains an incomplete tail of {} bytes",
+            recovery.wal.incomplete_tail_len,
+        );
     }
+
+    drop(recovery);
 
     let config = Arc::new(app_config.server);
 
@@ -228,7 +249,7 @@ fn main() -> io::Result<()> {
         println!("All client connections closed");
 
         let snapshot = store
-            .snapshot()
+            .snapshot_at_sequence(last_sequence)
             .map_err(|error| io::Error::other(format!("snapshot creation failed: {error:?}")))?;
 
         let parent = snapshot_path

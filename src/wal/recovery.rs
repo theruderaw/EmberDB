@@ -1,8 +1,10 @@
 use crate::persistence::{Snapshot, load_snapshot};
 use crate::wal::reader::{WalReadResult, read_wal};
 use crate::wal::record::RecordKind;
+use crate::wal::record::WalRecord;
 use crate::wal::replay::ReplayState;
 
+use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::path::Path;
 
@@ -34,6 +36,8 @@ pub fn recover(
     let mut last_sequence = checkpoint_sequence;
     let mut replayed_commands = 0;
 
+    let mut pending_transactions: HashMap<u64, Vec<&WalRecord>> = HashMap::new();
+
     for record in &wal.records {
         // Skip commands already included in the snapshot.
         if record.sequence <= checkpoint_sequence {
@@ -51,22 +55,62 @@ pub fn recover(
             )));
         }
 
-        // Transaction-aware replay will be added in M12.8.
-        if record.kind != RecordKind::Command || record.transaction_id != 0 {
-            return Err(invalid_data("transaction replay is not yet supported"));
+        match record.kind {
+            RecordKind::Begin => {
+                if pending_transactions.contains_key(&record.transaction_id) {
+                    return Err(invalid_data(format!(
+                        "duplicate BEGIN for transaction {}",
+                        record.transaction_id
+                    )));
+                }
+
+                pending_transactions.insert(record.transaction_id, Vec::new());
+            }
+            RecordKind::Command => {
+                if record.transaction_id == 0 {
+                    apply_record(&mut state, record)?;
+                    replayed_commands += 1;
+                } else {
+                    let commands = pending_transactions
+                        .get_mut(&record.transaction_id)
+                        .ok_or_else(|| {
+                            invalid_data(format!(
+                                "command without BEGIN for transaction {}",
+                                record.transaction_id
+                            ))
+                        })?;
+
+                    commands.push(record);
+                }
+            }
+            RecordKind::Commit => {
+                let commands = pending_transactions
+                    .remove(&record.transaction_id)
+                    .ok_or_else(|| {
+                        invalid_data(format!(
+                            "COMMIT without BEGIN for transaction {}",
+                            record.transaction_id
+                        ))
+                    })?;
+
+                for command in commands {
+                    apply_record(&mut state, command)?;
+                    replayed_commands += 1;
+                }
+            }
+            RecordKind::Abort => {
+                pending_transactions
+                    .remove(&record.transaction_id)
+                    .ok_or_else(|| {
+                        invalid_data(format!(
+                            "ABORT without BEGIN for transaction {}",
+                            record.transaction_id
+                        ))
+                    })?;
+            }
         }
 
-        state
-            .apply(&record.payload, record.timestamp_unix_ms)
-            .map_err(|error| {
-                invalid_data(format!(
-                    "replay failed at sequence {}: {error}",
-                    record.sequence
-                ))
-            })?;
-
         last_sequence = record.sequence;
-        replayed_commands += 1;
     }
 
     let snapshot = state.into_snapshot(last_sequence, recovery_timestamp);
@@ -76,6 +120,17 @@ pub fn recover(
         wal,
         replayed_commands,
     })
+}
+
+fn apply_record(state: &mut ReplayState, record: &WalRecord) -> io::Result<()> {
+    state
+        .apply(&record.payload, record.timestamp_unix_ms)
+        .map_err(|error| {
+            invalid_data(format!(
+                "replay failed at sequence {}: {error}",
+                record.sequence
+            ))
+        })
 }
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
@@ -138,6 +193,10 @@ mod tests {
         }
     }
 
+    // --------------------------------------------------
+    // Helpers
+    // --------------------------------------------------
+
     fn entry(key: &[u8], value: &[u8], expires_at_unix_ms: Option<u64>) -> SnapshotEntry {
         SnapshotEntry {
             key: key.to_vec(),
@@ -175,9 +234,29 @@ mod tests {
         )
     }
 
+    fn marker(sequence: u64, timestamp: u64, transaction_id: u64, kind: RecordKind) -> WalRecord {
+        WalRecord {
+            kind,
+            sequence,
+            timestamp_unix_ms: timestamp,
+            transaction_id,
+            payload: Vec::new(),
+        }
+    }
+
+    fn transactional(mut record: WalRecord, transaction_id: u64) -> WalRecord {
+        record.transaction_id = transaction_id;
+        record
+    }
+
+    // --------------------------------------------------
+    // Basic recovery
+    // --------------------------------------------------
+
     #[test]
     fn recovers_empty_state_when_both_files_are_missing() {
         let fixture = Fixture::new();
+
         let result = fixture.recover(1000).unwrap();
 
         assert_eq!(result.snapshot.version, SNAPSHOT_VERSION);
@@ -194,11 +273,14 @@ mod tests {
     #[test]
     fn recovers_snapshot_without_wal_and_removes_expired_entries() {
         let fixture = Fixture::new();
+
         let live = entry(b"live", b"value", Some(5001));
+
         fixture.save_checkpoint(
             10,
             vec![live.clone(), entry(b"expired", b"old", Some(5000))],
         );
+
         let original = fs::read(&fixture.snapshot_path).unwrap();
 
         let result = fixture.recover(5000).unwrap();
@@ -207,13 +289,16 @@ mod tests {
         assert_eq!(result.snapshot.entries, vec![live]);
         assert_eq!(result.replayed_commands, 0);
         assert!(result.wal.records.is_empty());
-        assert_eq!(fs::read(&fixture.snapshot_path).unwrap(), original);
+
+        assert_eq!(fs::read(&fixture.snapshot_path).unwrap(), original,);
+
         assert!(!fixture.wal_path.exists());
     }
 
     #[test]
     fn recovers_wal_without_snapshot() {
         let fixture = Fixture::new();
+
         fixture.write_records(vec![
             set(1, 1000, b"counter", b"10"),
             increment(2, 2000, b"counter"),
@@ -234,29 +319,41 @@ mod tests {
                 },
             ),
         ]);
+
         let original = fs::read(&fixture.wal_path).unwrap();
 
         let result = fixture.recover(7000).unwrap();
 
         assert_eq!(result.snapshot.last_sequence, 6);
+
         assert_eq!(
             result.snapshot.entries,
-            vec![entry(b"counter", b"11", None)]
+            vec![entry(b"counter", b"11", None)],
         );
+
         assert_eq!(result.replayed_commands, 6);
         assert_eq!(result.wal.records.len(), 6);
         assert_eq!(result.wal.last_sequence(), Some(6));
-        assert_eq!(result.wal.valid_len, original.len() as u64);
+
+        assert_eq!(result.wal.valid_len, original.len() as u64,);
+
         assert!(!result.wal.has_incomplete_tail());
-        assert_eq!(fs::read(&fixture.wal_path).unwrap(), original);
+
+        assert_eq!(fs::read(&fixture.wal_path).unwrap(), original,);
+
         assert!(!fixture.snapshot_path.exists());
     }
+
+    // --------------------------------------------------
+    // Checkpoint recovery
+    // --------------------------------------------------
 
     #[test]
     fn skips_checkpointed_records_without_reapplying_them() {
         let fixture = Fixture::new();
+
         fixture.save_checkpoint(2, vec![entry(b"counter", b"11", None)]);
-        // The old INCR would make the recovered counter incorrect if replayed twice.
+
         fixture.write_records(vec![
             increment(2, 2000, b"counter"),
             increment(3, 3000, b"counter"),
@@ -265,10 +362,12 @@ mod tests {
         let result = fixture.recover(4000).unwrap();
 
         assert_eq!(result.snapshot.last_sequence, 3);
+
         assert_eq!(
             result.snapshot.entries,
-            vec![entry(b"counter", b"12", None)]
+            vec![entry(b"counter", b"12", None)],
         );
+
         assert_eq!(result.replayed_commands, 1);
         assert_eq!(result.wal.records.len(), 2);
     }
@@ -276,24 +375,31 @@ mod tests {
     #[test]
     fn recovers_wal_starting_immediately_after_checkpoint() {
         let fixture = Fixture::new();
+
         fixture.save_checkpoint(100, vec![entry(b"counter", b"10", None)]);
+
         fixture.write_records(vec![increment(101, 2000, b"counter")]);
 
         let result = fixture.recover(3000).unwrap();
 
         assert_eq!(result.snapshot.last_sequence, 101);
+
         assert_eq!(
             result.snapshot.entries,
-            vec![entry(b"counter", b"11", None)]
+            vec![entry(b"counter", b"11", None)],
         );
+
         assert_eq!(result.replayed_commands, 1);
     }
 
     #[test]
     fn preserves_checkpoint_sequence_when_wal_is_entirely_older() {
         let fixture = Fixture::new();
+
         let checkpoint = entry(b"counter", b"20", None);
+
         fixture.save_checkpoint(10, vec![checkpoint.clone()]);
+
         fixture.write_records(vec![
             increment(8, 1000, b"counter"),
             increment(9, 2000, b"counter"),
@@ -307,10 +413,16 @@ mod tests {
         assert_eq!(result.wal.last_sequence(), Some(9));
     }
 
+    // --------------------------------------------------
+    // TTL recovery
+    // --------------------------------------------------
+
     #[test]
     fn uses_historical_timestamps_before_filtering_expired_entries() {
         let fixture = Fixture::new();
+
         fixture.save_checkpoint(10, vec![entry(b"counter", b"100", Some(5000))]);
+
         fixture.write_records(vec![
             increment(11, 4000, b"counter"),
             command(
@@ -326,68 +438,94 @@ mod tests {
         let result = fixture.recover(6000).unwrap();
 
         assert_eq!(result.snapshot.last_sequence, 12);
+
         assert_eq!(
             result.snapshot.entries,
-            vec![entry(b"counter", b"101", Some(14500))]
+            vec![entry(b"counter", b"101", Some(14500)),],
         );
+
         assert_eq!(result.replayed_commands, 2);
 
         let expired = fixture.recover(14500).unwrap();
+
         assert!(expired.snapshot.entries.is_empty());
         assert_eq!(expired.snapshot.last_sequence, 12);
         assert_eq!(expired.replayed_commands, 2);
     }
 
+    // --------------------------------------------------
+    // Incomplete WAL recovery
+    // --------------------------------------------------
+
     #[test]
     fn recovers_complete_records_and_reports_incomplete_tail_without_truncating() {
         let fixture = Fixture::new();
+
         let complete = set(1, 1000, b"counter", b"10").encode().unwrap();
+
         let partial = increment(2, 2000, b"counter").encode().unwrap();
+
         let valid_len = complete.len() as u64;
+
         let mut bytes = complete;
+
         bytes.extend_from_slice(&partial[..20]);
+
         fs::write(&fixture.wal_path, &bytes).unwrap();
 
         let result = fixture.recover(3000).unwrap();
 
         assert_eq!(result.snapshot.last_sequence, 1);
+
         assert_eq!(
             result.snapshot.entries,
-            vec![entry(b"counter", b"10", None)]
+            vec![entry(b"counter", b"10", None)],
         );
+
         assert_eq!(result.replayed_commands, 1);
         assert_eq!(result.wal.valid_len, valid_len);
         assert_eq!(result.wal.incomplete_tail_len, 20);
         assert!(result.wal.has_incomplete_tail());
-        assert_eq!(fs::read(&fixture.wal_path).unwrap(), bytes);
+
+        assert_eq!(fs::read(&fixture.wal_path).unwrap(), bytes,);
     }
+
+    // --------------------------------------------------
+    // Sequence validation
+    // --------------------------------------------------
 
     #[test]
     fn rejects_first_wal_sequence_without_snapshot_when_not_one() {
         let fixture = Fixture::new();
+
         fixture.write_records(vec![set(2, 1000, b"key", b"value")]);
 
         let error = fixture.recover(2000).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
-        assert!(error.to_string().contains("expected 1, received 2"));
+
+        assert!(error.to_string().contains("expected 1, received 2",));
     }
 
     #[test]
     fn rejects_gap_between_checkpoint_and_first_wal_record() {
         let fixture = Fixture::new();
+
         fixture.save_checkpoint(10, vec![]);
+
         fixture.write_records(vec![set(12, 1000, b"key", b"value")]);
 
         let error = fixture.recover(2000).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
-        assert!(error.to_string().contains("expected 11, received 12"));
+
+        assert!(error.to_string().contains("expected 11, received 12",));
     }
 
     #[test]
     fn rejects_gap_within_wal() {
         let fixture = Fixture::new();
+
         fixture.write_records(vec![
             set(1, 1000, b"key", b"value"),
             increment(3, 2000, b"counter"),
@@ -396,93 +534,216 @@ mod tests {
         let error = fixture.recover(3000).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
-        assert!(error.to_string().contains("WAL sequence mismatch"));
+
+        assert!(error.to_string().contains("WAL sequence mismatch",));
     }
 
-    #[test]
-    fn rejects_transaction_markers_after_checkpoint() {
-        let fixture = Fixture::new();
-
-        for kind in [RecordKind::Begin, RecordKind::Commit, RecordKind::Abort] {
-            fixture.write_records(vec![WalRecord {
-                kind,
-                sequence: 1,
-                timestamp_unix_ms: 1000,
-                transaction_id: 42,
-                payload: Vec::new(),
-            }]);
-
-            let error = fixture.recover(2000).unwrap_err();
-
-            assert_eq!(error.kind(), ErrorKind::InvalidData);
-            assert!(
-                error
-                    .to_string()
-                    .contains("transaction replay is not yet supported")
-            );
-        }
-    }
+    // --------------------------------------------------
+    // Transaction recovery
+    // --------------------------------------------------
 
     #[test]
-    fn rejects_transactional_command_after_checkpoint() {
+    fn replays_committed_transaction() {
         let fixture = Fixture::new();
-        let mut record = set(1, 1000, b"key", b"value");
-        record.transaction_id = 42;
-        fixture.write_records(vec![record]);
 
-        let error = fixture.recover(2000).unwrap_err();
+        fixture.write_records(vec![
+            set(1, 1000, b"counter", b"10"),
+            marker(2, 2000, 42, RecordKind::Begin),
+            transactional(increment(3, 3000, b"counter"), 42),
+            transactional(increment(4, 4000, b"counter"), 42),
+            marker(5, 5000, 42, RecordKind::Commit),
+        ]);
 
-        assert_eq!(error.kind(), ErrorKind::InvalidData);
-        assert!(
-            error
-                .to_string()
-                .contains("transaction replay is not yet supported")
+        let result = fixture.recover(6000).unwrap();
+
+        assert_eq!(result.snapshot.last_sequence, 5);
+        assert_eq!(result.replayed_commands, 3);
+
+        assert_eq!(
+            result.snapshot.entries,
+            vec![entry(b"counter", b"12", None)],
         );
     }
 
     #[test]
+    fn discards_aborted_transaction() {
+        let fixture = Fixture::new();
+
+        fixture.write_records(vec![
+            set(1, 1000, b"counter", b"10"),
+            marker(2, 2000, 42, RecordKind::Begin),
+            transactional(increment(3, 3000, b"counter"), 42),
+            marker(4, 4000, 42, RecordKind::Abort),
+        ]);
+
+        let result = fixture.recover(5000).unwrap();
+
+        assert_eq!(result.snapshot.last_sequence, 4);
+        assert_eq!(result.replayed_commands, 1);
+
+        assert_eq!(
+            result.snapshot.entries,
+            vec![entry(b"counter", b"10", None)],
+        );
+    }
+
+    #[test]
+    fn discards_uncommitted_transaction() {
+        let fixture = Fixture::new();
+
+        fixture.write_records(vec![
+            set(1, 1000, b"counter", b"10"),
+            marker(2, 2000, 42, RecordKind::Begin),
+            transactional(increment(3, 3000, b"counter"), 42),
+            transactional(set(4, 4000, b"new_key", b"value"), 42),
+        ]);
+
+        let result = fixture.recover(5000).unwrap();
+
+        assert_eq!(result.snapshot.last_sequence, 4);
+        assert_eq!(result.replayed_commands, 1);
+
+        assert_eq!(
+            result.snapshot.entries,
+            vec![entry(b"counter", b"10", None)],
+        );
+    }
+
+    // --------------------------------------------------
+    // Transaction lifecycle validation
+    // --------------------------------------------------
+
+    #[test]
+    fn rejects_transaction_records_without_begin() {
+        let fixture = Fixture::new();
+
+        let cases = [
+            (
+                transactional(increment(1, 1000, b"counter"), 42),
+                "command without BEGIN",
+            ),
+            (
+                marker(1, 1000, 42, RecordKind::Commit),
+                "COMMIT without BEGIN",
+            ),
+            (
+                marker(1, 1000, 42, RecordKind::Abort),
+                "ABORT without BEGIN",
+            ),
+        ];
+
+        for (record, expected_message) in cases {
+            fixture.write_records(vec![record]);
+
+            let error = fixture.recover(2000).unwrap_err();
+
+            assert_eq!(error.kind(), ErrorKind::InvalidData,);
+
+            assert!(error.to_string().contains(expected_message,));
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_transaction_begin() {
+        let fixture = Fixture::new();
+
+        fixture.write_records(vec![
+            marker(1, 1000, 42, RecordKind::Begin),
+            marker(2, 2000, 42, RecordKind::Begin),
+        ]);
+
+        let error = fixture.recover(3000).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+
+        assert!(error.to_string().contains("duplicate BEGIN"));
+    }
+
+    #[test]
+    fn rejects_committed_transaction_with_invalid_command() {
+        let fixture = Fixture::new();
+
+        fixture.write_records(vec![
+            marker(1, 1000, 42, RecordKind::Begin),
+            transactional(set(2, 2000, b"key", b"value"), 42),
+            transactional(command(3, 3000, Request::Ping), 42),
+            marker(4, 4000, 42, RecordKind::Commit),
+        ]);
+
+        let error = fixture.recover(5000).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+
+        assert!(error.to_string().contains("replay failed at sequence 3",));
+    }
+
+    // --------------------------------------------------
+    // Replay failure
+    // --------------------------------------------------
+
+    #[test]
     fn reports_replay_failure_with_sequence_number() {
         let fixture = Fixture::new();
+
         fixture.write_records(vec![
             set(1, 1000, b"counter", b"10"),
             command(2, 2000, Request::Ping),
         ]);
+
         let original = fs::read(&fixture.wal_path).unwrap();
 
         let error = fixture.recover(3000).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
-        assert!(error.to_string().contains("replay failed at sequence 2"));
-        assert!(error.to_string().contains("non-mutating command in WAL"));
-        assert_eq!(fs::read(&fixture.wal_path).unwrap(), original);
+
+        assert!(error.to_string().contains("replay failed at sequence 2",));
+
+        assert!(error.to_string().contains("non-mutating command in WAL",));
+
+        assert_eq!(fs::read(&fixture.wal_path).unwrap(), original,);
     }
+
+    // --------------------------------------------------
+    // Corruption detection
+    // --------------------------------------------------
 
     #[test]
     fn rejects_corrupt_snapshot_without_rewriting_it() {
         let fixture = Fixture::new();
+
         let bytes = b"{ invalid json";
+
         fs::write(&fixture.snapshot_path, bytes).unwrap();
+
         fixture.write_records(vec![set(1, 1000, b"key", b"value")]);
 
         let error = fixture.recover(2000).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+
         assert!(error.to_string().contains("invalid snapshot"));
-        assert_eq!(fs::read(&fixture.snapshot_path).unwrap().as_slice(), bytes);
+
+        assert_eq!(fs::read(&fixture.snapshot_path).unwrap().as_slice(), bytes,);
     }
 
     #[test]
     fn rejects_corrupt_complete_wal_without_truncating_it() {
         let fixture = Fixture::new();
+
         let mut bytes = set(1, 1000, b"key", b"value").encode().unwrap();
-        // Alter the checksum, leaving the record complete.
+
+        // Corrupt the checksum without changing
+        // the record length.
         *bytes.last_mut().unwrap() ^= 0xFF;
+
         fs::write(&fixture.wal_path, &bytes).unwrap();
 
         let error = fixture.recover(2000).unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::InvalidData);
+
         assert!(error.to_string().contains("ChecksumMismatch"));
-        assert_eq!(fs::read(&fixture.wal_path).unwrap(), bytes);
+
+        assert_eq!(fs::read(&fixture.wal_path).unwrap(), bytes,);
     }
 }
